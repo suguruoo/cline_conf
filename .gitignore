@@ -2,6 +2,9 @@
 data/
 kanban/
 tmp/
+tasks/
+agents/
+cron/
 
 # Certificate files
 *.pem
