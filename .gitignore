@@ -1,0 +1,6 @@
+# Cline runtime data
+data/
+kanban/
+
+# Certificate files
+*.pem
