@@ -19,11 +19,29 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+# 共通ユーティリティを import
+_SHARED = Path(__file__).resolve().parent.parent.parent / "shared"
+sys.path.insert(0, str(_SHARED))
+from lint_utils import (  # noqa: E402
+    BOX_CORNERS,
+    EMOJI_RANGES,
+    FENCE_RE,
+    IMG_RE,
+    SEP_RE,
+    SP1,
+    SP2,
+    TEXT_SYMBOLS,
+    is_emoji,
+    mask,
+    norm_text,
+    norm_url,
+    scan,
+)
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_CFG = {
@@ -34,27 +52,8 @@ DEFAULT_CFG = {
     "max_quote_chars": 1500,
 }
 
-FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 CITE_CLUSTER = re.compile(r"(?:\[\d+\](?![(:])(?:（二次）)?)+")
 CITE_ONE = re.compile(r"\[(\d+)\](?![(:])(（二次）)?")
-INLINE_CODE = re.compile(r"(`+)(?:(?!\1).)+?\1")
-LINK_DEST = re.compile(r"(\]\()([^)\s]*(?:\s+\"[^\"]*\")?)(\))")
-URL_RE = re.compile(r"https?://[^\s)>\]]+")
-HTML_TAG = re.compile(r"</?[A-Za-z][^>]*>")
-IMG_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
-SEP_RE = re.compile(r"^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?$")
-
-CJK = r"々〇ぁ-ゖゝ-ゟァ-ヺー-ヿ㐀-䶿一-鿿豈-﫿"
-SP1 = re.compile(f"([{CJK}])([A-Za-z0-9])")
-SP2 = re.compile(f"([A-Za-z0-9])([{CJK}])")
-
-EMOJI_RANGES = [
-    (0x1F1E6, 0x1F1FF), (0x1F300, 0x1FAFF), (0x2600, 0x27BF), (0x2B50, 0x2B50), (0x2B55, 0x2B55),
-    (0x2B1B, 0x2B1C), (0x231A, 0x231B), (0x23E9, 0x23F3), (0x23F8, 0x23FA), (0x2934, 0x2935),
-    (0x3030, 0x3030), (0x303D, 0x303D), (0x3297, 0x3297), (0x3299, 0x3299),
-]
-TEXT_SYMBOLS = set("★☆☐✓✗✘✔✖•▪▫◆◇○●◎")  # 文字記号として扱い絵文字に数えない
-BOX_CORNERS = set("┌┐┘╔╗╚╝┬┴┼╠╣╦╩╬")
 
 
 def load_cfg() -> dict:
@@ -65,60 +64,13 @@ def load_cfg() -> dict:
     return cfg
 
 
-def scan(lines):
-    kinds, fences, cur = [], [], None
-    for i, l in enumerate(lines):
-        m = FENCE_RE.match(l)
-        if cur is None:
-            if m:
-                cur = {"start": i, "marker": m.group(1), "info": m.group(2).strip(), "lines": []}
-                kinds.append("open")
-            else:
-                kinds.append("text")
-        else:
-            if m and m.group(1)[0] == cur["marker"][0] and len(m.group(1)) >= len(cur["marker"]) and not m.group(2).strip():
-                cur["end"] = i
-                fences.append(cur)
-                cur = None
-                kinds.append("close")
-            else:
-                cur["lines"].append(l)
-                kinds.append("code")
-    if cur:
-        cur["end"] = len(lines) - 1
-        cur["unclosed"] = True
-        fences.append(cur)
-    return kinds, fences
-
-
-def mask(line: str) -> str:
-    line = INLINE_CODE.sub(lambda m: "A" * len(m.group(0)), line)
-    line = LINK_DEST.sub(lambda m: m.group(1) + "\x00" * len(m.group(2)) + m.group(3), line)
-    line = URL_RE.sub(lambda m: "\x00" * len(m.group(0)), line)
-    line = HTML_TAG.sub(lambda m: "\x00" * len(m.group(0)), line)
-    return line
-
-
-def norm_url(u: str) -> str:
-    u = u.strip().strip("<>")
-    p = urllib.parse.urlsplit(u)
-    path = p.path.rstrip("/")
-    return urllib.parse.urlunsplit((p.scheme.lower(), p.netloc.lower(), path, p.query, ""))
-
-
-def norm_text(s: str) -> str:
-    s = unicodedata.normalize("NFKC", s)
-    s = s.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
-    s = re.sub(r"[​‌‍﻿]", "", s)
-    return re.sub(r"\s+", "", s)
-
-
 def cell_norm(s) -> str:
     s = str(s)
     s = re.sub(r"\[(\d+)\](（二次）)?", "", s)
     s = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", s)
     for t in ("**", "__", "`", "~~"):
         s = s.replace(t, "")
+    import unicodedata
     return re.sub(r"\s+", "", unicodedata.normalize("NFKC", s))
 
 
@@ -129,15 +81,6 @@ def split_row(line: str) -> list[str]:
     if s.endswith("|") and not s.endswith("\\|"):
         s = s[:-1]
     return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", s)]
-
-
-def is_emoji(ch: str) -> bool:
-    if ch in TEXT_SYMBOLS:
-        return False
-    cp = ord(ch)
-    if 0x1F3FB <= cp <= 0x1F3FF:
-        return False
-    return any(lo <= cp <= hi for lo, hi in EMOJI_RANGES)
 
 
 class Linter:
