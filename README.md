@@ -1,76 +1,204 @@
-# cline-harness (Phase 0 + Phase 1 + 運用規則・コンテキスト引き継ぎ・コーディング)
+# cline-harness
 
-Cline (VS Code 拡張 / CLI) 用の個人向けハーネス。共通プロトコル **spec → plan → progress → result** に、
-領域別プロファイルを差し替える構成。実装済み: 共通プロトコル、**リサーチレポート**、**コーディング** (Python 規約の機械検査)、シェル/Git 運用規則の強制、コンテキスト監視と引き継ぎ。
+Cline (VS Code 拡張 / CLI) 用の個人向けハーネス。  
+**「何を作るか」を決めてから動かす** ための仕組みを、hooks・rules・skills の三層で実現します。
+
+---
+
+## これは何か
+
+Cline にそのまま作業させると、途中で方向転換したり、承認なしに本番ファイルを書き換えたり、コンテキストが溢れても気づかないまま壊れた判断を続けることがあります。
+
+このハーネスは次の 3 つの問題を解決します。
+
+| 問題 | 解決策 |
+|---|---|
+| 「何を作るか」が曖昧なまま実装が走る | **spec → plan → progress → result** の 4 段階プロトコルで、各段階に人間の承認を挟む |
+| 危険な操作を止められない | **hooks** が `rm -rf ~` / 強制 push / ヒアドキュメント / `git add .` などをリアルタイムで拒否する |
+| コンテキストが溢れて判断が壊れる | **コンテキスト監視** がトークンを推定し、65% 超で自動的に引き継ぎファイルを生成する |
+
+---
+
+## 全体構成
 
 ```
-cline-harness/
-├── rules/            常時ロード (薄く): 00-principles / 10-task-protocol / 20-safety / 30-shell-and-git / 35-context-handoff / 40-coding
-├── workflows/        tasks.md (開始・再開と各段階) / review.md (コードレビュー)
-├── skills/
-│   ├── task-protocol/    共通プロトコル (taskctl, tasklib, テンプレ, 書き方ガイド)
-│   ├── profile-coding/   コーディング (check_python.py, 規約 PY-01〜, レビュー観点, plan テンプレ)
-│   └── profile-research-report/  調査レポート (lint_report, ledger, テンプレ, 規則, アノテーションチェック)
-├── hooks/            PreToolUse (ゲート強制・シェル規則・コンテキスト上限・コーディング skill 強制)
-│                     PostToolUse (コンテキスト推定の加算) / PreCompact (圧縮前の退避) / TaskStart (引き継ぎの注入。TaskResume 兼用)
-├── install.sh        ~/Documents/Cline/{Rules,Workflows,Hooks} と ~/.cline/skills に配置
-├── docs/PHASE0-smoke-test.md   実機確認の手順 (最初にこれ)
-└── tests/            回帰テスト (python3 -m unittest discover -s tests)
+.cline/
+├── rules/          Cline が常時読む薄いルール集
+├── workflows/      タスク開始・再開・レビューの手順書
+├── hooks/          ツール実行前後に走る Python スクリプト
+├── skills/         タスク種別ごとの詳細ガイド + lint スクリプト
+│   ├── shared/         複数 skill が共有するユーティリティ
+│   ├── task-protocol/  共通プロトコル (taskctl CLI)
+│   ├── profile-coding/        Python / TypeScript 規約
+│   ├── profile-docs/          ドキュメント作成規約
+│   ├── profile-research-report/  Web 調査レポート規約
+│   └── profile-architecture/  ADR 形式のアーキテクチャ設計規約
+├── agents/         サブエージェント定義 (code-reviewer など)
+└── tests/          回帰テスト (52 件)
 ```
 
-タスクの状態は作業ディレクトリの `tasks/<task-id>/` に置く:
-`spec.md plan.md progress.md result.md approvals.json task.json notes.md scratch/` (+ 調査レポートは `deliverables/ sources/ ledger.json annotations.md`)。
+---
 
-## 使い方
+## 三層のしくみ
+
+### 層 1 — rules (常時ロード)
+
+Cline が毎回読み込む 6 つの薄いルールファイル。
+
+| ファイル | 内容 |
+|---|---|
+| `00-principles.md` | 日本語応答・根拠明示・破壊的操作の禁止 |
+| `10-task-protocol.md` | spec→plan→progress→result の使い方 |
+| `20-safety.md` | 削除・本番反映・強制 push の確認必須 |
+| `30-shell-and-git.md` | ヒアドキュメント禁止・`git add .` 禁止・コミット単位など |
+| `35-context-handoff.md` | コンテキスト 50%/65%/80% 時の引き継ぎ手順 |
+| `40-coding.md` | コード編集前に skill `profile-coding` を読む必須ルール |
+
+### 層 2 — hooks (自動ガード)
+
+ツール実行のたびに走る Python スクリプト群。**モデルが意図的に回避しない限り止められます。**
+
+```
+PreToolUse ─── ① コンテキスト超過チェック (80% 超 → 引き継ぎ以外を拒否)
+               ② シェル規則違反 (heredoc / git add . / git commit -a など)
+               ③ 破壊的コマンド (rm -rf ~ / sudo / 強制 push / terraform destroy など)
+               ④ タスクプロトコル (plan 承認前はタスク領域外への書き込みを拒否)
+               ⑤ コーディング規約 (profile-coding 未読み込みなら .py/.ts/.tsx 書き込みを拒否)
+
+PostToolUse ── コンテキストトークン推定値を加算
+
+PreCompact ─── コンテキスト圧縮前に handoff.auto.md を自動生成
+
+TaskStart ──── タスク開始時にアクティブタスクの要約を Cline のコンテキストに注入
+```
+
+**ブロックされる操作の例:**
 
 ```bash
-./install.sh                      # 配置 (既存は上書きしない / --copy / --dry-run / --uninstall)
-alias taskctl='python3 ~/cline-harness/skills/task-protocol/scripts/taskctl.py'
+# ❌ これらは PreToolUse に拒否される
+rm -rf ~
+git add .
+git push --force origin main
+cat << EOF > file.txt    # ヒアドキュメント
+sudo apt install xxx
+terraform destroy
 ```
 
-Cline で `/tasks.md` を実行 → 領域を選ぶ → spec を書かせる → 人間が承認:
+### 層 3 — skills (タスク別ガイド)
+
+`/tasks.md` を実行すると Cline が領域を判定し、対応する skill を読み込みます。
+
+| 起動条件 | skill | 機械検査スクリプト |
+|---|---|---|
+| Web 調査・リサーチ | `profile-research-report` | `lint_report.py` (引用照合・和英スペース・表 JSON など 20+ ルール) |
+| コーディング | `profile-coding` | `check_python.py` (PY-01〜26) / `check_ts.py` (ESLint + Prettier) |
+| ドキュメント作成 | `profile-docs` | `lint_doc.py` (プレースホルダ・和英スペース・絵文字) |
+| アーキテクチャ設計 | `profile-architecture` | `lint_adr.py` (ADR 必須フィールド検査) |
+| その他 | `task-protocol` (共通) | `taskctl gate` (書式・網羅性) |
+
+---
+
+## タスクの流れ
+
+```
+Cline で /tasks.md を実行
+        │
+        ▼
+① spec  ── 目的・AC・前提を書く → taskctl gate spec → 人間が承認
+        │
+        ▼
+② plan  ── ステップ・使用モジュール・リスクを書く → taskctl gate plan → 人間が承認
+        │   (ここで plan が承認されると、タスク領域外への書き込みが解放される)
+        ▼
+③ progress ── ステップを実行 → 1 ステップごとに progress.md に証拠を書く
+        │      逸脱が必要なら D1 を起票して停止 → 人間が承認
+        ▼
+④ result ── AC の判定と証拠 → taskctl gate result → 人間が承認 → taskctl done
+```
+
+**人間だけが実行するコマンド:**
 
 ```bash
-taskctl status                   # 現在のタスクと承認状態
-taskctl gate spec                # 機械検査 (Cline も実行する)
-taskctl approve spec             # 人間だけが実行 (plan / result / 逸脱 D1 も同様)
-taskctl done                     # result 承認後に閉じる
+taskctl approve spec     # spec の承認
+taskctl approve plan     # plan の承認 (= 使用モジュールの承認)
+taskctl approve result   # result の承認
+taskctl approve D1       # 逸脱の承認
+taskctl done             # タスクを閉じる
 ```
+
+**Cline が実行するコマンド:**
+
+```bash
+taskctl status           # 現在のタスクと承認状態を確認
+taskctl gate spec        # spec の書式・網羅性を検査
+taskctl gate plan        # plan の検査
+taskctl gate progress    # progress の検査
+taskctl gate result      # result の検査 (lint も実行される)
+taskctl handoff          # 引き継ぎファイルを生成
+```
+
+---
+
+## セットアップ
+
+```bash
+# taskctl を PATH に追加
+ln -sf ~/.cline/skills/task-protocol/scripts/taskctl.py /opt/homebrew/bin/taskctl
+
+# hooklib / tasklib を Python から import できるようにする
+echo ~/.cline/skills/task-protocol/scripts > \
+  ~/Library/Python/3.x/lib/python/site-packages/cline-harness.pth
+```
+
+Cline の設定で以下の hooks を登録する (VS Code 設定または Cline の Hooks 設定画面):
+
+| イベント | スクリプト |
+|---|---|
+| PreToolUse | `~/.cline/hooks/PreToolUse` |
+| PostToolUse | `~/.cline/hooks/PostToolUse` |
+| PreCompact | `~/.cline/hooks/PreCompact` |
+| TaskStart | `~/.cline/hooks/TaskStart` |
+
+---
+
+## 機械検査スクリプト一覧
+
+すべて**標準ライブラリのみ**で動作します。
+
+| スクリプト | 場所 | 主な検査内容 |
+|---|---|---|
+| `taskctl.py` | `skills/task-protocol/scripts/` | spec/plan/progress/result の書式・網羅性 |
+| `check_python.py` | `skills/profile-coding/scripts/` | Python 規約 PY-01〜26 (型ヒント・命名・docstring など) |
+| `check_ts.py` | `skills/profile-coding/scripts/` | ESLint + Prettier (npx 経由、未インストールは graceful skip) |
+| `lint_report.py` | `skills/profile-research-report/scripts/` | 引用照合・和英スペース・表 JSON・絵文字など 20+ ルール |
+| `lint_doc.py` | `skills/profile-docs/scripts/` | プレースホルダ残留・和英スペース・絵文字 |
+| `lint_adr.py` | `skills/profile-architecture/scripts/` | ADR 必須フィールド (h1・ステータス・コンテキスト・決定内容・結果) |
+| `ledger.py` | `skills/profile-research-report/scripts/` | 調査ソースの台帳登録・スナップショット取得 |
+| `lint_utils.py` | `skills/shared/` | 上記 lint が共有するユーティリティ (和英スペース・フェンス解析など) |
+
+---
+
+## テスト
+
+```bash
+cd ~/.cline
+python3 -m unittest discover -s tests -v
+# → 52 tests OK (1 skipped: mmdc 未導入)
+```
+
+---
 
 ## 設計上の取り決め
 
-- **承認は本文のハッシュで記録**する。承認後に spec/plan を変えると失効 (stale) し、再承認まで書き込みが止まる。frontmatter の status 変更では失効しない。
-- **progress は自動検査 + 逸脱時のみ人間承認**。done には証拠 (実在パスか `cmd:`)、plan に無いステップは逸脱として起票。
-- **ゲートは hook と workflow の二段**: hook = plan 承認までタスク領域外への書き込みを拒否、workflow 内の gate = 書式と網羅性の検証。
-- **レポートの引用は台帳で照合**: スクリプトが取得した本文に対して原文引用を検証する。一次/二次・独立性 (origin) も台帳で判定する。
-- 規則と lint ID の対応は `skills/profile-research-report/docs/report-rules.md`。許可絵文字などは `scripts/config.json`。
+- **承認はハッシュで記録する。** 承認後に spec/plan の本文を変えると自動的に失効し、再承認まで書き込みが止まる。frontmatter の `status` 変更は失効しない。
+- **hooks は速度制限 + 監査であり、完全な防御ではない。** モデルが任意スクリプトを直接実行した場合は検出できない。
+- **コンテキスト使用量は推定値。** 文字数ベースで積算しているため実際の Cline 表示とずれることがある。`~/.cline-harness/context.json` で窓幅・補正係数を調整する。
 
-## 運用規則・コンテキスト・コーディング
+---
 
-- **シェル/Git 規則 (rules/30)**: ヒアドキュメント・複数行引数・`python -c` の複数行・対話コマンド・`wait`・`git add .`/`commit -a`・
-  形式違反のコミットメッセージ・9 ファイル以上のコミットを PreToolUse が拒否する。ログは `> /tmp/x.txt 2>&1` で保存して読む (/tmp は常に許可)。
-- **コンテキスト監視 (rules/35)**: PostToolUse がトークンを **推定** し、50% で警告、65% で `handoff.auto.md` を自動生成して引き継ぎを促し、
-  80% を超えると引き継ぎ作業以外を拒否する。閾値・窓幅は `~/.cline-harness/context.json`、解除は `~/.cline-harness/ctx-off`。
-  `taskctl handoff` で `handoff.md` を作り「引き継ぎメモ」を記入、`--check` で検査。新規タスクの TaskStart/TaskResume が要約を注入する。
-- **コーディング (rules/40)**: コードを書く前に skill `profile-coding` の読み込みを hook が要求する。plan に「使用モジュール」表
-  (用途・選定理由・却下した代替) とテスト手順を必須とし、result ゲートで `check_python.py` を実行する。TypeScript は自動検査の対象外 (レビュー観点のみ)。
+## 限界
 
-## 限界 (正直に)
+- hook の有効化方法 (ファイル配置 / SDK 方式) はバージョンで変わりうる。
+- lint は形式と照合のみ。事実の正確性・日本語の自然さ・結論の妥当性はアノテーションチェック (人間の承認) に依存する。
+- TypeScript の `check_ts.py` は `npx` が必要。未インストール環境では WARN を出して skip する。
 
-- **コンテキスト使用量は実測ではなく推定** (文字数ベース)。実際の Cline 表示と比べて `context.json` を補正すること。ずれが大きいと早すぎる/遅すぎる停止になる。
-- **hook 方式の不確実性**: ここでは従来のスクリプト hook (`PreToolUse` 等のファイル) を前提にしている。使用中のバージョンが SDK/プラグイン方式 (`beforeTool` 等) のみなら、
-  各 hook は JSON 入出力の単体スクリプトなので薄いラッパで包めばよい。Phase 0 §5 で確定する。
-
-- hook は **速度制限 + 監査** であり、完全な防御ではない。モデルが任意のスクリプトを実行して書き込む場合は検出できない。
-  承認の改ざんは、直接編集とコマンドの両方を拒否しているが、迂回の余地はゼロではない (承認ファイルはハッシュで検証されるため、本文を差し替えた承認は失効する)。
-- hook の仕様 (ツール名・パラメータ・命名規則・有効化) は Phase 0 の実機確認で確定する。バージョンで変わりうる。
-- lint は形式と照合のみ。事実の正確性・日本語の自然さ・結論の妥当性・図の要否は、アノテーションチェック (LLM + 人間の承認) に依存する。
-- Web 検索ツールは、プロバイダが Bedrock の場合に Cline 標準で使えるかが未確認 (Phase 0 §7)。
-
-## 次のフェーズ
-
-| Phase | 内容 |
-|---|---|
-| 2 | `profile-docs` (和英スペース等の lint を共有)。lint の共通部分を切り出す |
-| 3 | `profile-architecture` (ADR 形式)、reviewer サブエージェント、`.cline/agents/` の形式確認 |
-| 4 | 代表タスクによる回帰テスト (ハーネス自体のテスト)。`profile-coding` は前倒しで実装済み (TypeScript の自動検査は未実装) |
