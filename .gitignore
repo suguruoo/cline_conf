@@ -1,6 +1,11 @@
 # Cline runtime data
 data/
 kanban/
+tmp/
 
 # Certificate files
 *.pem
+
+# Python
+__pycache__/
+*.pyc

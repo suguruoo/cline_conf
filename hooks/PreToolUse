@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""Cline PreToolUse hook (ファイル名は拡張子なしの `PreToolUse`、chmod +x)。
+
+強制する内容 (すべて決定論的):
+ 1. コンテキスト: 推定使用量が hard_pct を超えたら、引き継ぎ作業以外のツールを拒否する。
+ 2. シェル運用規則: heredoc / 複数行の引数 / python -c の長文 / 対話コマンド / wait / git add . / git commit -a /
+    コミットメッセージ形式 / 大きすぎるコミット を拒否する。
+ 3. 破壊的コマンド (rm -rf ~, sudo, 強制 push, terraform, クラウドの delete 系 など) の拒否。
+ 4. タスクプロトコル: spec/plan 承認までタスク領域外への書き込みを拒否。承認の改ざんも拒否。
+ 5. コーディング: skill `profile-coding` を読むまで .py/.ts/.tsx の書き込みを拒否する (/tmp など作業領域外は対象外)。
+
+方針: 内部エラーは fail-open (ログ + モデルへ警告)。ツール名は従来名 (write_to_file / execute_command) と
+SDK 名 (editor / run_commands) の両方に対応。これは速度制限 + 監査であり、完全な防御ではない。
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+
+def _home():
+    p = Path.home() / ".cline-harness" / "home"
+    if p.exists():
+        return Path(p.read_text().strip())
+    if os.environ.get("CLINE_HARNESS_HOME"):
+        return Path(os.environ["CLINE_HARNESS_HOME"])
+    return Path(os.path.realpath(__file__)).parent.parent
+
+
+sys.path.insert(0, str(_home() / "skills" / "task-protocol" / "scripts"))
+import hooklib as H  # noqa: E402
+import tasklib as T  # noqa: E402
+
+STATE_DIR = H.STATE_DIR
+COMMIT_MAX_FILES = 8
+CODE_EXT = (".py", ".ts", ".tsx")
+CODING_SKILL = "profile-coding"
+
+WRITE_RE = re.compile(r"(write|replace|edit|patch|create|delete|remove|move|rename|new_rule)", re.I)
+CMD_TOOL_RE = re.compile(r"^(execute_command|run_commands?|execute_commands?|bash|shell)$", re.I)
+HARD_ALLOWED_TOOLS = re.compile(r"(new_?task|attempt_completion|ask_followup|ask_question|plan_mode_respond|submit_and_exit|condense|compact)", re.I)
+PATH_KEYS = {"path", "absolutePath", "file_path", "filePath", "target_path", "targetPath", "file",
+             "filename", "dest", "destination", "source", "old_path", "new_path"}
+PATCH_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File:\s*(.+?)\s*$|^\+\+\+ (?:b/)?(\S+)", re.M)
+
+DENY = [
+    (r"\brm\s+-[a-zA-Z]*[rR][a-zA-Z]*\s+(?:--\s+)?(?:/|/\*|~|~/|~/\*|\$HOME|\$HOME/|\.|\./|\*)(?=\s|$|;|&|\|)",
+     "ルート・ホーム・カレントの再帰削除"),
+    (r"\bsudo\b", "sudo"),
+    (r"(curl|wget)\b[^|;\n]*\|\s*(sudo\s+)?(ba|z)?sh\b", "ダウンロードしたスクリプトの直接実行"),
+    (r"\bgit\s+push\b[^;\n]*(--force\b|--force-with-lease\b|\s-f\b)", "強制 push"),
+    (r"\bgit\s+(reset\s+--hard|clean\s+-[a-zA-Z]*f)", "作業内容を失う git 操作"),
+    (r"\bterraform\s+(destroy|apply)\b", "terraform の破壊的/反映操作"),
+    (r"\bgcloud\b[^;\n]*\b(delete|destroy)\b", "gcloud の削除系"),
+    (r"\bbq\s+rm\b", "bq rm"),
+    (r"\bgsutil\s+(-m\s+)?(rm|rb)\b", "gsutil rm / rb"),
+    (r"\baws\b[^;\n]*\b(delete-\S+|terminate-\S+|rm|rb)\b", "aws の削除/終了系"),
+    (r"(?i)\b(drop\s+(table|database|schema)|truncate\s+table)\b", "DROP / TRUNCATE"),
+]
+MUTATING_VERBS = re.compile(r"(?:^|\s)(rm|mv|cp|touch|mkdir|rmdir|tee|ln|chmod|chown|truncate|dd|install)\b")
+MUTATING_OTHER = re.compile(
+    r"\bsed\s+-[a-zA-Z]*i|\bperl\s+-[a-zA-Z]*i|\bfind\b.*(-delete|-exec)"
+    r"|\bgit\s+(add|commit|push|checkout|switch|reset|merge|rebase|apply|stash|clean|restore|cherry-pick)\b"
+    r"|\b(npm|pnpm|yarn)\s+(install|add|i|remove)\b|\bpip3?\s+(install|uninstall)\b|\bbrew\s+(install|uninstall)\b"
+)
+HARNESS_CMD = re.compile(r"(taskctl|lint_report|check_python)\.py")
+REDIR = re.compile(r"(?<![<>&0-9])>>?\s*([^\s;&|]+)")
+TAMPER_CMD = re.compile(r"taskctl(?:\.py)?\b[^;&|\n]*\b(approve|reopen)\b|taskctl(?:\.py)?\b[^;&|\n]*\bactive\b[^;&|\n]*--clear")
+READONLY_START = re.compile(r"^\s*(cat|ls|head|tail|grep|rg|jq|stat|wc)\b")
+
+# ---- シェル運用規則
+HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]|[A-Za-z_\\])")
+PY_C = re.compile(r"\bpython[0-9.]*\s+-c\b")
+EDITORS = {"vi", "vim", "nvim", "nano", "emacs", "pico", "less", "more", "top", "htop", "man", "watch"}
+GIT_PAGER_CMDS = {"log", "diff", "show", "blame", "reflog", "shortlog"}
+CONV_COMMIT = re.compile(r"^[a-z]+(\([^)]+\))?!?: \S")
+MSG_HEREDOC = ("[harness] heredoc (<< EOF) と複数行の python -c は使えません。ファイルは write_to_file (editor) で作成し、"
+               "`bash /tmp/script.sh` のように実行してください。")
+MSG_MULTILINE = ("[harness] コマンド引数に改行を含む文字列は渡せません。write_to_file で /tmp/commit_msg.txt などを作成し、"
+                 "`git commit -F /tmp/commit_msg.txt` / `gh pr create --body-file /tmp/pr_body.md` のようにファイル経由で渡してください。"
+                 "1 行で済むなら `git commit -m \"fix: 要約\"` で構いません。")
+
+
+def scan_quotes(cmd):
+    """引用符の中身を除いた文字列と、引用符の中に改行があったかを返す。"""
+    out, q, nl, i = [], None, False, 0
+    while i < len(cmd):
+        c = cmd[i]
+        if q:
+            if c == "\\" and q == '"' and i + 1 < len(cmd):
+                i += 2
+                continue
+            if c == q:
+                q = None
+                out.append(c)
+            elif c == "\n":
+                nl = True
+            i += 1
+            continue
+        if c == "\\" and i + 1 < len(cmd):
+            out.append(" ")
+            i += 2
+            continue
+        if c in "'\"":
+            q = c
+        out.append(c)
+        i += 1
+    return "".join(out), nl
+
+
+def segments(stripped):
+    return [s.split() for s in re.split(r"&&|\|\||;|\n|\|", stripped) if s.strip()]
+
+
+def git_parts(tokens):
+    """('git' の) フラグ列とサブコマンド、サブコマンド以降のトークンを返す。"""
+    flags, i = [], 1
+    while i < len(tokens):
+        t = tokens[i]
+        if t in ("-C", "-c"):
+            flags.append(t)
+            i += 2
+            continue
+        if t.startswith("-"):
+            flags.append(t)
+            i += 1
+            continue
+        return flags, t, tokens[i + 1:]
+    return flags, "", []
+
+
+def staged_count(root):
+    try:
+        cp = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=str(root), capture_output=True,
+                            text=True, timeout=3)
+        return len([l for l in cp.stdout.splitlines() if l.strip()]) if cp.returncode == 0 else 0
+    except Exception:
+        return 0
+
+
+def check_commit(cmd, tokens, rest, roots):
+    if any(re.fullmatch(r"-[a-zA-Z]*a[a-zA-Z]*", t) and not t.startswith("--") for t in rest if t != "--amend") \
+            or "--all" in rest:
+        return True, "[harness] `git commit -a` は使えません。変更を `git add <ファイル>` で個別に選び、1 つの意味のある単位でコミットしてください。"
+    try:
+        toks = shlex.split(cmd)
+    except ValueError:
+        return False, ""
+    msgs, i = [], 0
+    while i < len(toks):
+        t = toks[i]
+        if t in ("-m", "--message") and i + 1 < len(toks):
+            msgs.append(toks[i + 1])
+            i += 2
+            continue
+        if t.startswith("--message="):
+            msgs.append(t.split("=", 1)[1])
+        if t in ("-F", "--file") and i + 1 < len(toks):
+            fp = Path(os.path.expanduser(toks[i + 1]))
+            if not fp.is_absolute() and roots:
+                fp = roots[0] / fp
+            if fp.exists():
+                msgs.append(fp.read_text(encoding="utf-8", errors="replace").strip().splitlines()[0:1] and
+                            fp.read_text(encoding="utf-8", errors="replace").strip().splitlines()[0])
+        i += 1
+    if msgs and msgs[0] and not CONV_COMMIT.match(msgs[0]):
+        return True, (f"[harness] コミットメッセージは『type: 変更内容の要約』の形式にしてください (現在: 「{msgs[0][:40]}」)。"
+                      "例: `fix: GCE startup script - remove exec redirect` / `docs: add CLINE.md with operation rules`。"
+                      "`update various files` のような曖昧なメッセージは不可です。")
+    if roots:
+        n = staged_count(roots[0])
+        if n > COMMIT_MAX_FILES:
+            return True, (f"[harness] ステージされたファイルが {n} 件あり、1 コミットが大きすぎます (上限 {COMMIT_MAX_FILES})。"
+                          "`git reset <ファイル>` で外し、意味のある単位に分けてコミットしてください。")
+    return False, ""
+
+
+def guard_shell_style(cmd, roots):
+    stripped, nl_in_quote = scan_quotes(cmd)
+    if HEREDOC.search(stripped):
+        return True, MSG_HEREDOC
+    if PY_C.search(stripped) and ("\n" in cmd.strip() or len(cmd) > 400):
+        return True, MSG_HEREDOC
+    if nl_in_quote:
+        return True, MSG_MULTILINE
+    if re.search(r"(?m)(?:^|[;&|(]\s*)wait\b", stripped):
+        return True, ("[harness] `wait` はコマンドチェーンに含められません (Ctrl+C が効かなくなり固まります)。"
+                      "バックグラウンドのプロセスは `kill %1` / `pkill` で明示的に終了し、待つ場合は `sleep N && 確認コマンド` にしてください。")
+    for tok in segments(stripped):
+        c0 = os.path.basename(tok[0])
+        rest = tok[1:]
+        sub = next((t for t in rest if not t.startswith("-")), "")
+        if c0 in EDITORS or (c0 == "tail" and any(t in ("-f", "-F", "--follow") for t in rest)) or \
+                (c0 in ("python", "python3", "node") and not rest):
+            return True, f"[harness] 対話的/終了しないコマンド ({c0}) は使えません。ファイルは read_file / write_to_file で扱ってください。"
+        if any(t in ("-it", "-ti", "--interactive", "--tty") for t in rest) or \
+                (c0 in ("docker", "podman", "kubectl") and sub in ("run", "exec") and
+                 any(re.fullmatch(r"-[a-zA-Z]*[it][a-zA-Z]*", t) for t in rest)):
+            return True, "[harness] 対話フラグ (-it / --interactive) が必要なコマンドは使えません。"
+        if c0 in ("rm", "cp", "mv") and any(re.fullmatch(r"-[a-zA-Z]*i[a-zA-Z]*", t) for t in rest):
+            return True, f"[harness] 確認プロンプトが出る `{c0} -i` は使えません。"
+        if c0 == "git":
+            flags, gsub, grest = git_parts(tok)
+            if gsub in GIT_PAGER_CMDS and "--no-pager" not in flags and "-P" not in flags:
+                return True, f"[harness] ページャーが開くため `git --no-pager {gsub} …` と書いてください。"
+            if (gsub in ("rebase", "add", "clean") and ("-i" in grest or "--interactive" in grest)) or \
+                    (gsub in ("add", "checkout", "restore", "reset", "stash", "commit") and
+                     ("-p" in grest or "--patch" in grest)):
+                return True, "[harness] 対話モードの git (-i / -p) は使えません。"
+            if gsub == "add" and any(t in (".", "*", "-A", "--all", "-u", "--update") for t in grest):
+                return True, "[harness] `git add .` / `-A` は使えません。コミットする単位のファイルを個別に指定してください。"
+            if gsub == "commit":
+                bad = check_commit(cmd, tok, grest, roots)
+                if bad[0]:
+                    return bad
+        if c0 in ("apt", "apt-get") and sub in ("install", "remove", "purge", "upgrade", "dist-upgrade", "autoremove") \
+                and not any(t in ("-y", "--yes", "-qq", "--assume-yes") for t in rest):
+            return True, f"[harness] 確認プロンプトが出るため `{c0} {sub}` には -y を付けてください。"
+        if c0 in ("pip", "pip3") and sub == "uninstall" and not any(t in ("-y", "--yes") for t in rest):
+            return True, "[harness] `pip uninstall` には -y を付けてください。"
+        if c0 == "npm" and sub == "init" and not any(t in ("-y", "--yes") for t in rest):
+            return True, "[harness] `npm init` には -y を付けてください。"
+        if c0 == "npx" and sub and not any(t in ("-y", "--yes") for t in rest[:rest.index(sub)]):
+            return True, "[harness] `npx` には -y / --yes を付けてください (インストール確認で止まります)。"
+        if c0 in ("journalctl", "systemctl") and (c0 == "journalctl" or sub == "status") and "--no-pager" not in rest:
+            return True, f"[harness] ページャーが開くため `{c0} … --no-pager` と書いてください。"
+    return False, ""
+
+
+# ---- パス・ツール判定
+def extract_paths(obj, found=None):
+    found = [] if found is None else found
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, str):
+                if k in PATH_KEYS:
+                    found.append(v)
+                if k in ("arguments", "input", "args"):
+                    try:
+                        extract_paths(json.loads(v), found)
+                    except Exception:
+                        pass
+                for m in PATCH_RE.finditer(v):
+                    found.append(m.group(1) or m.group(2))
+            else:
+                extract_paths(v, found)
+    elif isinstance(obj, list):
+        for v in obj:
+            extract_paths(v, found)
+    return [p for p in found if p and p != "/dev/null"]
+
+
+def extract_commands(tool, params):
+    if not CMD_TOOL_RE.match(tool) and not (tool.endswith("command") and "command" in params):
+        return []
+    cmds = []
+    for key in ("command", "commands", "cmd"):
+        v = params.get(key)
+        if isinstance(v, str):
+            cmds.append(v)
+        elif isinstance(v, list):
+            for x in v:
+                cmds.append(x if isinstance(x, str) else str((x or {}).get("command", "")))
+    return [c for c in cmds if c.strip()]
+
+
+def is_write(tool, params):
+    if tool == "editor" and str(params.get("command", "")).lower() == "view":
+        return False
+    return bool(WRITE_RE.search(tool)) or tool in ("editor", "use_mcp_tool")
+
+
+def resolve(p, roots):
+    q = Path(os.path.expanduser(p))
+    if not q.is_absolute():
+        q = (roots[0] if roots else Path.cwd()) / q
+    return Path(os.path.realpath(q))
+
+
+def inside(p: Path, d: Path):
+    try:
+        p.relative_to(Path(os.path.realpath(d)))
+        return True
+    except ValueError:
+        return False
+
+
+def actives(roots):
+    res = []
+    for r in roots:
+        t = T.active_task(r)
+        if t:
+            res.append((Path(os.path.realpath(r)), t))
+    return res
+
+
+def msg_closed(root, task, why):
+    cmd = f"python3 {T.SCRIPT_DIR / 'taskctl.py'} --root {root}"
+    return (f"[harness] {why}。タスク領域外への書き込みは、spec と plan が承認されるまでできません。"
+            f"spec.md / plan.md を整えて `{cmd} gate spec|plan` を通し、ユーザーに承認を依頼してください。"
+            f"承認はユーザーが `{cmd} approve spec` / `approve plan` で行います。あなたが approve を実行してはいけません。"
+            f" (task: {task.id})")
+
+
+# ---- ガード
+def guard_context(tool, params, data, roots, cmds):
+    if (STATE_DIR / "ctx-off").exists() or not data.get("taskId"):
+        return False, ""
+    cfg = H.ctx_config()
+    st = H.ctx_load(data["taskId"])
+    pct = H.ctx_pct(st, cfg)
+    if H.ctx_level(pct, cfg) != "hard" or HARD_ALLOWED_TOOLS.search(tool):
+        return False, ""
+    act = actives(roots)
+    if is_write(tool, params):
+        ok_names = ("handoff.md", "handoff.auto.md", "progress.md", "notes.md")
+        paths = [resolve(p, roots) for p in extract_paths(params)]
+        if paths and act and all(inside(p, t.dir) and p.name in ok_names for p in paths for _, t in act[:1]):
+            return False, ""
+    if cmds and all(HARNESS_CMD.search(c) or c.strip().startswith("date") for c in cmds):
+        return False, ""
+    cmd = f"python3 {T.SCRIPT_DIR / 'taskctl.py'}"
+    return True, (f"[harness] コンテキスト推定が {pct}% ({cfg['hard_pct']}% 超) のため、通常の作業は続けられません。"
+                  f"1) `{cmd} handoff` で handoff.md を生成し『引き継ぎメモ』を記入 2) `{cmd} handoff --check` が PASS を確認 "
+                  "3) new_task ツール (または /newtask) で新規タスクに引き継いでください。"
+                  "推定が実際より高い場合は ~/.cline-harness/context.json を調整するか、ユーザーが ~/.cline-harness/ctx-off を作成します。")
+
+
+def guard_write(tool, params, roots):
+    paths = extract_paths(params)
+    if not paths:
+        return False, ""
+    resolved = [resolve(p, roots) for p in paths]
+    for root, task in actives(roots):
+        prot = {Path(os.path.realpath(task.dir / T.APPROVALS)), Path(os.path.realpath(root / "tasks" / T.ACTIVE))}
+        for rp in resolved:
+            if rp in prot:
+                return True, f"[harness] {rp.name} はユーザー専用のファイルです。直接編集できません。"
+        ok, why = T.writes_open(task)
+        if ok:
+            continue
+        for rp in resolved:
+            if not inside(rp, root):
+                continue
+            if inside(rp, task.dir):
+                rel = rp.relative_to(Path(os.path.realpath(task.dir)))
+                if rel.parts and rel.parts[0] in T.PRE_APPROVAL_WRITABLE:
+                    continue
+            return True, msg_closed(root, task, why)
+    return False, ""
+
+
+def guard_coding(params, data, roots):
+    code = [p for p in (resolve(x, roots) for x in extract_paths(params))
+            if p.suffix in CODE_EXT and any(inside(p, r) for r in roots)]
+    if not code or H.skill_loaded(data.get("taskId") or "", CODING_SKILL):
+        return False, ""
+    return True, (f"[harness] コードを書く前に skill `{CODING_SKILL}` を読み込んでください (use_skill)。"
+                  "コーディング規約・使用モジュールの承認手順・テスト規約が定義されています。"
+                  "(/tmp など作業ディレクトリ外の一時スクリプトは対象外です)")
+
+
+def seg_paths_ok(seg, root, task):
+    try:
+        toks = shlex.split(seg)
+    except ValueError:
+        return False
+    args = [t for t in toks[1:] if not t.startswith("-")]
+    if not args:
+        return False
+    return all(inside(resolve(a, [root]), task.dir) for a in args)
+
+
+def guard_command(cmd, roots):
+    bad = guard_shell_style(cmd, roots)
+    if bad[0]:
+        return bad
+    for pat, why in DENY:
+        if re.search(pat, cmd):
+            return True, (f"[harness] 破壊的なコマンドのため実行できません ({why})。"
+                          "必要ならユーザーに内容を説明して確認を取り、ユーザー自身の端末で実行してもらってください。")
+    if TAMPER_CMD.search(cmd):
+        return True, "[harness] 承認系コマンド (approve / reopen / active --clear) はユーザーだけが実行できます。ユーザーに依頼してください。"
+    for seg in re.split(r"&&|\|\||;|\n|\|", cmd):
+        if re.search(r"approvals\.json|tasks/\.active", seg) and not READONLY_START.match(seg):
+            return True, "[harness] approvals.json / tasks/.active はユーザー専用です。"
+    for root, task in actives(roots):
+        ok, why = T.writes_open(task)
+        if ok:
+            continue
+        for m in REDIR.finditer(cmd):
+            tgt = m.group(1)
+            if tgt == "/dev/null" or tgt.startswith("&"):
+                continue
+            rp = resolve(tgt, [root])
+            if not inside(rp, root):
+                continue  # /tmp など作業ディレクトリ外への出力 (ログ・一時ファイル) は許可
+            tdir = Path(os.path.realpath(task.dir))
+            if inside(rp, tdir) and rp.relative_to(tdir).parts[:1] and rp.relative_to(tdir).parts[0] in T.PRE_APPROVAL_WRITABLE:
+                continue
+            return True, msg_closed(root, task, why)
+        for seg in re.split(r"&&|\|\||;|\n|\|", cmd):
+            s = seg.strip()
+            if not s or HARNESS_CMD.search(s):
+                continue
+            if MUTATING_OTHER.search(s):
+                return True, msg_closed(root, task, why)
+            if MUTATING_VERBS.search(" " + s) and not seg_paths_ok(s, root, task):
+                tg = [a for a in s.split()[1:] if not a.startswith("-")]
+                if tg and all(not inside(resolve(a, [root]), root) for a in tg):
+                    continue  # 作業ディレクトリ外 (/tmp など) だけを対象にする操作
+                return True, msg_closed(root, task, why)
+    return False, ""
+
+
+def decide(data):
+    pre = data.get("preToolUse") or {}
+    tool = pre.get("toolName") or ""
+    params = pre.get("parameters") or {}
+    if not isinstance(params, dict):
+        params = {}
+    roots = [Path(r) for r in (data.get("workspaceRoots") or [])]
+    tid = data.get("taskId") or ""
+    if tid and CODING_SKILL in json.dumps(params, ensure_ascii=False):
+        H.skill_mark(tid, CODING_SKILL)
+    cmds = extract_commands(tool, params)
+    if H.debug_on():
+        rec = {"tool": tool, "param_keys": list(params.keys()), "paths": extract_paths(params),
+               "cmds": cmds[:3], "roots": [str(r) for r in roots], "taskId": tid,
+               "ctx_pct": H.ctx_pct(H.ctx_load(tid)) if tid else None}
+        if "full" in (STATE_DIR / "debug").read_text():
+            rec["params"] = params
+        H.log("hook-inputs.jsonl", json.dumps(rec, ensure_ascii=False))
+    res = guard_context(tool, params, data, roots, cmds)
+    if res[0]:
+        return res
+    for c in cmds:
+        res = guard_command(c, roots)
+        if res[0]:
+            return res
+    if not cmds and is_write(tool, params):
+        for g in (lambda: guard_write(tool, params, roots), lambda: guard_coding(params, data, roots)):
+            res = g()
+            if res[0]:
+                return res
+    return False, ""
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        H.out({"cancel": False})
+    try:
+        cancel, msg = decide(data)
+    except Exception as e:  # fail-open
+        H.log("hook.log", f"GUARD ERROR {e!r}")
+        H.out({"cancel": False, "contextModification":
+               "[harness] ガード処理でエラーが発生したため、直前のツール呼び出しはチェックされていません。~/.cline-harness/hook.log を確認するようユーザーに伝えてください。"})
+    if cancel:
+        H.log("hook.log", f"BLOCK {data.get('preToolUse', {}).get('toolName')}: {msg[:160]}")
+        H.out({"cancel": True, "errorMessage": msg})
+    H.out({"cancel": False})
+
+
+main()
