@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Cline TaskStart / TaskResume hook (同じファイルを TaskResume としても配置する)。
+
+新しいタスク (new_task での引き継ぎを含む) の開始時に、アクティブなタスクの要約を注入し、
+handoff.md から自動的に再開できるようにする。コンテキスト推定もリセットする。
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def _home():
+    p = Path.home() / ".cline-harness" / "home"
+    if p.exists():
+        return Path(p.read_text().strip())
+    if os.environ.get("CLINE_HARNESS_HOME"):
+        return Path(os.environ["CLINE_HARNESS_HOME"])
+    return Path(os.path.realpath(__file__)).parent.parent
+
+
+sys.path.insert(0, str(_home() / "skills" / "task-protocol" / "scripts"))
+import hooklib as H  # noqa: E402
+import tasklib as T  # noqa: E402
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        H.out({"cancel": False})
+    try:
+        tid = data.get("taskId") or ""
+        if tid and data.get("hookName") != "TaskResume":
+            H.ctx_save(tid, {"tokens": 0, "level": "ok", "skills": [], "compactions": 0})
+        for r in data.get("workspaceRoots") or []:
+            t = T.active_task(Path(r))
+            if not t:
+                continue
+            extra = ""
+            if (t.dir / T.HANDOFF).exists():
+                extra += f" tasks/{t.id}/handoff.md が存在します。最初にこれと progress.md を読んでください。"
+            elif (t.dir / T.HANDOFF_AUTO).exists():
+                extra += f" tasks/{t.id}/handoff.auto.md (自動チェックポイント) があります。読んでから再開してください。"
+            if t.profile == "coding":
+                extra += " coding のタスクです。コードを書く前に skill `profile-coding` を読み込んでください。"
+            H.out({"cancel": False, "contextModification":
+                   "[harness] アクティブなタスクがあります。/tasks.md の手順で再開してください。\n"
+                   + T.summary_text(t) + "\n" + extra})
+    except Exception as e:  # fail-open
+        H.log("hook.log", f"TaskStart ERROR {e!r}")
+    H.out({"cancel": False})
+
+
+main()

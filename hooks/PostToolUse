@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Cline PostToolUse hook: コンテキスト使用量の推定と、段階的な警告・自動チェックポイント。
+
+ツールの入出力サイズ (パラメータ + 結果) をタスクごとに積算し、推定使用率が
+warn_pct / handoff_pct を超えた瞬間に一度だけ contextModification で指示を返す
+(次のリクエストに反映される)。handoff_pct を超えたら handoff.auto.md も自動生成する。
+hard_pct を超えると PreToolUse が引き継ぎ作業以外を拒否する。
+推定は実際より小さく出やすい。Cline の表示と見比べて ~/.cline-harness/context.json で補正すること。
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def _home():
+    p = Path.home() / ".cline-harness" / "home"
+    if p.exists():
+        return Path(p.read_text().strip())
+    if os.environ.get("CLINE_HARNESS_HOME"):
+        return Path(os.environ["CLINE_HARNESS_HOME"])
+    return Path(os.path.realpath(__file__)).parent.parent
+
+
+sys.path.insert(0, str(_home() / "skills" / "task-protocol" / "scripts"))
+import hooklib as H  # noqa: E402
+import tasklib as T  # noqa: E402
+
+MESSAGES = {
+    "warn": ("[harness] コンテキスト推定 {pct}% ({used}/{window} tokens)。区切りの良いところまで進めて progress.md を更新し、"
+             "`{ctl} handoff` で引き継ぎファイルを作る準備をしてください。大きなファイルは範囲指定で読み、"
+             "長い出力はファイルに保存して必要な部分だけ読んでください。"),
+    "handoff": ("[harness] コンテキスト推定 {pct}%。新しい作業を始めず、いま着手中のステップだけを終えてください。"
+                "続けて `{ctl} handoff` を実行し、handoff.md の『引き継ぎメモ』を記入、`{ctl} handoff --check` が PASS になったら "
+                "new_task ツール (または /newtask) で新規タスクに引き継いでください。{auto}"),
+}
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        H.out({"cancel": False})
+    try:
+        post = data.get("postToolUse") or {}
+        tid = data.get("taskId") or ""
+        if not tid:
+            H.out({"cancel": False})
+        cfg = H.ctx_config()
+        tokens = H.est_tokens(str(post.get("result", "")), cfg) + \
+            H.est_tokens(json.dumps(post.get("parameters", {}), ensure_ascii=False), cfg)
+        st, crossed = H.ctx_add(tid, tokens)
+        pct = H.ctx_pct(st, cfg)
+        if H.debug_on():
+            H.log("hook-inputs.jsonl", json.dumps({"post": post.get("toolName"), "added": tokens, "est_pct": pct, "taskId": tid}))
+        if crossed in ("warn", "handoff"):
+            ctl = f"python3 {T.SCRIPT_DIR / 'taskctl.py'}"
+            auto = ""
+            if crossed == "handoff":
+                for r in data.get("workspaceRoots") or []:
+                    t = T.active_task(Path(r))
+                    if t:
+                        p = T.write_handoff(t, auto=True)
+                        auto = f"(自動チェックポイントを {p.name} に保存しました)"
+                        break
+            used = int((cfg["baseline_tokens"] + st["tokens"]) * cfg["factor"])
+            H.out({"cancel": False, "contextModification": MESSAGES[crossed].format(
+                pct=pct, used=used, window=cfg["window_tokens"], ctl=ctl, auto=auto)})
+    except Exception as e:  # fail-open
+        H.log("hook.log", f"PostToolUse ERROR {e!r}")
+    H.out({"cancel": False})
+
+
+main()

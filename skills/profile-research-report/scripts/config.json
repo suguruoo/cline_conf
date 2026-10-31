@@ -1,0 +1,7 @@
+{
+  "emoji_allowlist": ["✅", "❌", "⚠", "💡", "📌", "📊", "🔍", "📝", "🔧", "🚀", "🔒", "💰", "⏱", "🧩"],
+  "emoji_max_kinds": 15,
+  "uncertainty_keywords": ["不確実", "限界", "留意"],
+  "secondary_marker": "（二次）",
+  "max_quote_chars": 1500
+}

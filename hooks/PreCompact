@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""Cline PreCompact hook: 会話履歴が圧縮される直前に、自動チェックポイントを保存する。
+
+圧縮で失われうる状態 (承認状況・次のステップ・承認待ち) を handoff.auto.md に書き、
+圧縮後のモデルに復元手順を contextModification で渡す。推定使用量は圧縮後の値にリセットする。
+入力に含まれる実測のコンテキスト指標は、デバッグ ON のときログに残す (推定の補正に使う)。
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def _home():
+    p = Path.home() / ".cline-harness" / "home"
+    if p.exists():
+        return Path(p.read_text().strip())
+    if os.environ.get("CLINE_HARNESS_HOME"):
+        return Path(os.environ["CLINE_HARNESS_HOME"])
+    return Path(os.path.realpath(__file__)).parent.parent
+
+
+sys.path.insert(0, str(_home() / "skills" / "task-protocol" / "scripts"))
+import hooklib as H  # noqa: E402
+import tasklib as T  # noqa: E402
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        H.out({"cancel": False})
+    try:
+        tid = data.get("taskId") or ""
+        if H.debug_on():
+            H.log("hook-inputs.jsonl", "PreCompact " + json.dumps(data.get("preCompact", {}), ensure_ascii=False)[:600])
+        if tid:
+            st = H.ctx_load(tid)
+            cfg = H.ctx_config()
+            st["tokens"] = min(20000, int(cfg["window_tokens"] * 0.2))  # 圧縮後の要約分の概算
+            st["level"] = "ok"
+            st["compactions"] = st.get("compactions", 0) + 1
+            H.ctx_save(tid, st)
+        for r in data.get("workspaceRoots") or []:
+            t = T.active_task(Path(r))
+            if t:
+                p = T.write_handoff(t, auto=True)
+                ctl = f"python3 {T.SCRIPT_DIR / 'taskctl.py'}"
+                H.out({"cancel": False, "contextModification":
+                       f"[harness] 会話履歴が圧縮されました。状態を復元するため、tasks/{t.id}/{p.name}・handoff.md (あれば)・progress.md を読み直し、"
+                       f"`{ctl} status` で承認状態を確認してください。圧縮で詳細が失われているため、区切りの良いところで handoff を作成して新規タスクで続けることを推奨します。"})
+    except Exception as e:  # fail-open
+        H.log("hook.log", f"PreCompact ERROR {e!r}")
+    H.out({"cancel": False})
+
+
+main()
