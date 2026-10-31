@@ -413,5 +413,198 @@ class LedgerTests(unittest.TestCase):
             shutil.rmtree(web, ignore_errors=True)
 
 
+LINT_DOC = ROOT / "skills/profile-docs/scripts/lint_doc.py"
+LINT_ADR = ROOT / "skills/profile-architecture/scripts/lint_adr.py"
+CHECK_TS = ROOT / "skills/profile-coding/scripts/check_ts.py"
+
+
+class LintDocTests(unittest.TestCase):
+    """lint_doc.py のテスト。"""
+
+    def setUp(self):
+        self.td = Path(tempfile.mkdtemp())
+        self.doc = self.td / "doc.md"
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def lint(self, text: str, extra: tuple = ()) -> tuple[int, list]:
+        # Arrange
+        self.doc.write_text(text, encoding="utf-8")
+        # Act
+        cp = run([LINT_DOC, self.doc, "--json", *extra])
+        issues = json.loads(cp.stdout) if cp.stdout.strip().startswith("[") else []
+        # Assert (caller)
+        return cp.returncode, issues
+
+    def rules(self, text: str) -> set[str]:
+        _, issues = self.lint(text)
+        return {i["rule"] for i in issues if i["severity"] == "ERROR"}
+
+    def test_good_doc_passes(self):
+        # Arrange: プレースホルダなし・和英スペースあり・許可リスト内絵文字
+        good = "# テストドキュメント\n\n概要: Python の使い方について説明します。✅\n\n## 手順\n\n1. まず環境を構築する。\n"
+        # Act
+        rc, issues = self.lint(good)
+        # Assert
+        self.assertEqual(rc, 0, issues)
+        self.assertEqual([i for i in issues if i["severity"] == "ERROR"], [])
+
+    def test_placeholder_detected(self):
+        # Arrange: プレースホルダ残留
+        bad = "# タイトル\n\n{{TODO}}\n"
+        # Act / Assert
+        self.assertIn("STRUCT-0", self.rules(bad))
+
+    def test_ja_en_spacing_detected(self):
+        # Arrange: 和英スペースなし
+        bad = "# タイトル\n\nPythonについて説明する。\n"
+        # Act / Assert
+        self.assertIn("SPACE-1", self.rules(bad))
+
+    def test_emoji_outside_allowlist_detected(self):
+        # Arrange: 許可リスト外絵文字
+        bad = "# タイトル\n\n🎉 お疲れ様でした。\n"
+        # Act / Assert
+        self.assertIn("EMOJI-2", self.rules(bad))
+
+    def test_unclosed_fence_detected(self):
+        # Arrange: 閉じられていないコードフェンス
+        bad = "# タイトル\n\n```python\nprint('hello')\n"
+        # Act / Assert
+        self.assertIn("STRUCT-0", self.rules(bad))
+
+
+class LintAdrTests(unittest.TestCase):
+    """lint_adr.py のテスト。"""
+
+    GOOD_ADR = """\
+# ADR-001: データベース選定
+
+## ステータス
+
+承認済み
+
+## コンテキスト
+
+マイクロサービスのデータストアを選定する必要がある。
+
+## 決定内容
+
+PostgreSQL を採用する。
+
+## 採用理由
+
+ACID 準拠で JSON サポートがある。
+
+## 結果
+
+### ポジティブな影響
+
+- 信頼性が高い
+
+### ネガティブな影響・トレードオフ
+
+- 運用コストが増加する
+"""
+
+    def setUp(self):
+        self.td = Path(tempfile.mkdtemp())
+        self.adr = self.td / "adr-001-db.md"
+
+    def tearDown(self):
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def lint(self, text: str) -> tuple[int, list]:
+        # Arrange
+        self.adr.write_text(text, encoding="utf-8")
+        # Act
+        cp = run([LINT_ADR, self.adr, "--json"])
+        issues = json.loads(cp.stdout) if cp.stdout.strip().startswith("[") else []
+        # Assert (caller)
+        return cp.returncode, issues
+
+    def rules(self, text: str) -> set[str]:
+        _, issues = self.lint(text)
+        return {i["rule"] for i in issues if i["severity"] == "ERROR"}
+
+    def test_good_adr_passes(self):
+        # Act
+        rc, issues = self.lint(self.GOOD_ADR)
+        # Assert
+        self.assertEqual(rc, 0, issues)
+        self.assertEqual([i for i in issues if i["severity"] == "ERROR"], [])
+
+    def test_invalid_title_format(self):
+        # Arrange: ADR-NNN 形式でない
+        bad = self.GOOD_ADR.replace("# ADR-001: データベース選定", "# データベース選定")
+        # Act / Assert
+        self.assertIn("ADR-1", self.rules(bad))
+
+    def test_missing_required_section(self):
+        # Arrange: 必須セクション欠落
+        bad = self.GOOD_ADR.replace("## コンテキスト\n\nマイクロサービスのデータストアを選定する必要がある。\n\n", "")
+        # Act / Assert
+        self.assertIn("ADR-2", self.rules(bad))
+
+    def test_invalid_status(self):
+        # Arrange: 無効なステータス
+        bad = self.GOOD_ADR.replace("承認済み", "approved")
+        # Act / Assert
+        self.assertIn("ADR-3", self.rules(bad))
+
+    def test_empty_section(self):
+        # Arrange: 決定内容が空
+        bad = self.GOOD_ADR.replace("PostgreSQL を採用する。", "")
+        # Act / Assert
+        self.assertIn("ADR-4", self.rules(bad))
+
+    def test_placeholder_detected(self):
+        # Arrange: プレースホルダ残留
+        bad = self.GOOD_ADR.replace("PostgreSQL を採用する。", "{{TODO}}")
+        # Act / Assert
+        self.assertIn("STRUCT-0", self.rules(bad))
+
+
+class CheckTsTests(unittest.TestCase):
+    """check_ts.py のテスト。"""
+
+    def test_help_exits_zero(self):
+        # Act
+        cp = run([CHECK_TS, "--help"])
+        # Assert
+        self.assertEqual(cp.returncode, 0)
+
+    def test_no_ts_files_exits_zero(self):
+        # Arrange: TypeScript ファイルがないディレクトリ
+        td = Path(tempfile.mkdtemp())
+        try:
+            # Act
+            cp = run([CHECK_TS, "--root", td, td])
+            # Assert
+            self.assertEqual(cp.returncode, 0)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_npx_not_found_returns_zero_with_warn(self):
+        # Arrange: npx が見つからない状況をシミュレート (PATH を空にする)
+        td = Path(tempfile.mkdtemp())
+        (td / "x.ts").write_text("const x = 1;\n")
+        env = dict(os.environ, PATH="")
+        try:
+            # Act
+            cp = subprocess.run(
+                [sys.executable, str(CHECK_TS), "--json", str(td)],
+                capture_output=True, text=True, env=env,
+            )
+            # Assert: npx なし環境では 0 exit、WARN を出す
+            self.assertEqual(cp.returncode, 0)
+            issues = json.loads(cp.stdout) if cp.stdout.strip().startswith("[") else []
+            self.assertTrue(any(i["severity"] == "WARN" for i in issues))
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
+
