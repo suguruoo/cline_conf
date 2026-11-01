@@ -36,8 +36,10 @@ import tasklib as T  # noqa: E402
 
 STATE_DIR = H.STATE_DIR
 COMMIT_MAX_FILES = 8
-CODE_EXT = (".py", ".ts", ".tsx")
+CODE_EXT = (".py", ".ts", ".tsx", ".js", ".jsx", ".html", ".css", ".go", ".r")
 CODING_SKILL = "profile-coding"
+# skill が「読まれた」と判定するパスパターン（write 操作は対象外）
+SKILL_READ_RE = re.compile(r"skills/profile-coding/(?:SKILL\.md|docs/)", re.IGNORECASE)
 
 WRITE_RE = re.compile(r"(write|replace|edit|patch|create|delete|remove|move|rename|new_rule)", re.I)
 CMD_TOOL_RE = re.compile(r"^(execute_command|run_commands?|execute_commands?|bash|shell)$", re.I)
@@ -354,9 +356,21 @@ def guard_write(tool, params, roots):
 
 
 def guard_coding(params, data, roots):
-    code = [p for p in (resolve(x, roots) for x in extract_paths(params))
-            if p.suffix in CODE_EXT and any(inside(p, r) for r in roots)]
-    if not code or H.skill_loaded(data.get("taskId") or "", CODING_SKILL):
+    tid = data.get("taskId") or ""
+    code = []
+    for x in extract_paths(params):
+        p = resolve(x, roots)
+        if p.suffix not in CODE_EXT:
+            continue
+        # roots が空のときは絶対パスのファイルすべてを対象にする（bypass させない）
+        if roots and not any(inside(p, r) for r in roots):
+            continue
+        code.append(p)
+    if not code:
+        H.log("hook.log", f"guard_coding PASS(no-code-paths) paths={extract_paths(params)[:3]}")
+        return False, ""
+    if H.skill_loaded(tid, CODING_SKILL):
+        H.log("hook.log", f"guard_coding PASS(skill-loaded) tid={tid}")
         return False, ""
     return True, (f"[harness] コードを書く前に skill `{CODING_SKILL}` を読み込んでください (use_skill)。"
                   "コーディング規約・使用モジュールの承認手順・テスト規約が定義されています。"
@@ -424,8 +438,10 @@ def decide(data):
         params = {}
     roots = [Path(r) for r in (data.get("workspaceRoots") or [])]
     tid = data.get("taskId") or ""
-    if tid and CODING_SKILL in json.dumps(params, ensure_ascii=False):
-        H.skill_mark(tid, CODING_SKILL)
+    if tid and not is_write(tool, params):
+        paths_str = json.dumps(extract_paths(params), ensure_ascii=False)
+        if SKILL_READ_RE.search(paths_str):
+            H.skill_mark(tid, CODING_SKILL)
     cmds = extract_commands(tool, params)
     if H.debug_on():
         rec = {"tool": tool, "param_keys": list(params.keys()), "paths": extract_paths(params),
